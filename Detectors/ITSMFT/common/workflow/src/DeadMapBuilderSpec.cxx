@@ -17,6 +17,9 @@
 #include "DataFormatsITSMFT/Digit.h"
 #include "DataFormatsITSMFT/CompCluster.h"
 #include "DataFormatsITSMFT/TimeDeadMap.h"
+#include "ITSMFTReconstruction/DecodingStat.h"
+#include <TFile.h>
+#include <TTree.h> 
 
 namespace o2
 {
@@ -86,6 +89,20 @@ void ITSMFTDeadMapBuilder::init(InitContext& ic)
   }
 
   LOG(info) << "Sampling one TF every " << mTFSampling << " with " << mTFSamplingTolerance << " TF tolerance";
+
+  mStuckPixelFileName = ic.options().get<std::string>("save-stuck-pixels");
+
+  if (!mRunMFT && !mStuckPixelFileName.empty()) {
+    LOG(info) << "Stuck pixel saving ENABLED. Output file: " << mStuckPixelFileName;
+    mErrorTree = new TTree ("ErrorTree", "Stuck Pixel Errors");
+    mErrorTree->SetDirectory(nullptr);
+    mErrorTree->Branch("orbit", &mErrOrbit, "orbit/L"); 
+    mErrorTree->Branch("chipid", &mErrChipID, "chipid/S");
+    mErrorTree->Branch("row", &mErrRow, "row/S");
+    mErrorTree->Branch("col", &mErrCol, "col/S");
+  } else {
+    LOG(info) << "Stuck pixel saving DISABLED.";
+  }
 
   return;
 }
@@ -172,6 +189,21 @@ void ITSMFTDeadMapBuilder::finalizeOutput()
     outfile.WriteObjectAny(&mMapObject, "o2::itsmft::TimeDeadMap", "ccdb_object");
     outfile.Close();
   }
+
+  if (mErrorTree && !mStuckPixelFileName.empty()) {
+      std::string stuckOutFileName = mLocalOutputDir + "/" + mStuckPixelFileName;
+      TFile stuckOutFile(stuckOutFileName.c_str(), "RECREATE");
+      
+      if (!stuckOutFile.IsZombie()) {
+          stuckOutFile.cd();
+          mErrorTree->Write();
+          stuckOutFile.Close();
+          LOG(info) << "Stuck Pixel Tree saved to separate file: " << stuckOutFileName;
+      } else {
+          LOG(error) << "Failed to open " << stuckOutFileName << " for stuck pixel tree.";
+      }
+  }
+
   return;
 }
 
@@ -213,6 +245,21 @@ void ITSMFTDeadMapBuilder::run(ProcessingContext& pc)
   }
 
   mStepCounter++;
+
+  if (mErrorTree) {
+      const auto repErrors = pc.inputs().get<gsl::span<o2::itsmft::ErrorMessage>>("repErr");
+      for (const auto& err : repErrors) {
+          if (err.errType == o2::itsmft::ChipStat::RepeatingPixel) {
+              mErrOrbit = (long)mFirstOrbitTF; 
+              mErrChipID = (short)err.id;
+              mErrRow = (short)err.errInfo0; 
+              mErrCol = (short)err.errInfo1; 
+            
+              mErrorTree->Fill(); 
+          }
+      }
+  }
+
   LOG(info) << "Processing step #" << mStepCounter << " out of " << mTFCounter << " good TF received. First orbit " << mFirstOrbitTF;
 
   mDeadMapTF.clear();
@@ -304,76 +351,89 @@ void ITSMFTDeadMapBuilder::run(ProcessingContext& pc)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-void ITSMFTDeadMapBuilder::PrepareOutputCcdb(EndOfStreamContext* ec, std::string ccdburl = "")
+void ITSMFTDeadMapBuilder::PrepareOutputCcdb(EndOfStreamContext* ec, std::string ccdburl)
 {
-
-  // if ccdburl is specified, the object is sent to ccdb from this workflow
-
   long tend = o2::ccdb::getCurrentTimestamp();
-
   std::map<std::string, std::string> md = {{"map_version", MAP_VERSION}, {"runNumber", std::to_string(mRunNumber)}};
-
   std::string path = mRunMFT ? "MFT/Calib/" : "ITS/Calib/";
-  std::string name_str = "TimeDeadMap";
 
-  o2::ccdb::CcdbObjectInfo info((path + name_str), name_str, mObjectName, md, mTimeStart - 120 * 1000, tend + 60 * 1000);
 
-  auto image = o2::ccdb::CcdbApi::createObjectImage(&mMapObject, &info);
-  info.setFileName(mObjectName);
+  if (mMapObject.getEvolvingMapSize() > 0) {
+    std::string name_str = "TimeDeadMap";
+    o2::ccdb::CcdbObjectInfo info((path + name_str), name_str, mObjectName, md, mTimeStart - 120 * 1000, tend + 60 * 1000);
+    auto image = o2::ccdb::CcdbApi::createObjectImage(&mMapObject, &info);
+    info.setFileName(mObjectName);
+    info.setAdjustableEOV();
 
-  info.setAdjustableEOV();
-
-  if (ec != nullptr) {
-
-    LOG(important) << "Sending object " << info.getPath() << "/" << info.getFileName()
-                   << " to ccdb-populator, of size " << image->size() << " bytes, valid for "
-                   << info.getStartValidityTimestamp() << " : " << info.getEndValidityTimestamp();
-
-    if (mRunMFT) {
-      ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "TimeDeadMap", 1}, *image.get());
-      ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "TimeDeadMap", 1}, info);
-    } else {
-      ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "TimeDeadMap", 0}, *image.get());
-      ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "TimeDeadMap", 0}, info);
+    if (ec != nullptr) {
+      LOG(important) << "Sending object " << info.getPath() << "/" << info.getFileName()
+                     << " to ccdb-populator, of size " << image->size() << " bytes";
+      if (mRunMFT) {
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "TimeDeadMap", 1}, *image.get());
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "TimeDeadMap", 1}, info);
+      } else {
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "TimeDeadMap", 0}, *image.get());
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "TimeDeadMap", 0}, info);
+      }
+    } else if (!ccdburl.empty()) {
+      LOG(important) << mSelfName << " sending object " << ccdburl << "/browse/" << info.getPath() << "/" << info.getFileName();
+      o2::ccdb::CcdbApi mApi;
+      mApi.init(ccdburl);
+      mApi.storeAsBinaryFile(
+        &image->at(0), image->size(), info.getFileName(), info.getObjectType(),
+        info.getPath(), info.getMetaData(),
+        info.getStartValidityTimestamp(), info.getEndValidityTimestamp());
+      o2::ccdb::adjustOverriddenEOV(mApi, info);
     }
+  } else {
+    LOG(warning) << "Time-dependent dead map is empty and will not be forwarded as output";
   }
 
-  else if (!ccdburl.empty()) { // send from this workflow
 
-    LOG(important) << mSelfName << " sending object " << ccdburl << "/browse/" << info.getPath() << "/" << info.getFileName()
-                   << " of size " << image->size() << " bytes, valid for "
-                   << info.getStartValidityTimestamp() << " : " << info.getEndValidityTimestamp();
+  if (mErrorTree && !mStuckPixelFileName.empty()) {
+    std::string name_sp = "StuckPixels"; 
+    o2::ccdb::CcdbObjectInfo info_sp((path + name_sp), name_sp, mStuckPixelFileName, md, mTimeStart - 120 * 1000, tend + 60 * 1000);
+    
 
-    o2::ccdb::CcdbApi mApi;
-    mApi.init(ccdburl);
-    mApi.storeAsBinaryFile(
-      &image->at(0), image->size(), info.getFileName(), info.getObjectType(),
-      info.getPath(), info.getMetaData(),
-      info.getStartValidityTimestamp(), info.getEndValidityTimestamp());
-    o2::ccdb::adjustOverriddenEOV(mApi, info);
-  }
+    auto image_sp = o2::ccdb::CcdbApi::createObjectImage(mErrorTree, &info_sp);
+    info_sp.setFileName(mStuckPixelFileName);
+    info_sp.setAdjustableEOV();
 
-  else {
+    if (ec != nullptr) { 
+      LOG(important) << "Sending StuckPixels object to ccdb-populator, Path: " << info_sp.getPath();
+      if (mRunMFT) {
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "StuckPixels", 1}, *image_sp.get());
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "StuckPixels", 1}, info_sp);
+      } else {
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBPayload, "StuckPixels", 0}, *image_sp.get());
+        ec->outputs().snapshot(Output{o2::calibration::Utils::gDataOriginCDBWrapper, "StuckPixels", 0}, info_sp);
+      }
+    } else if (!ccdburl.empty()) {
+      LOG(important) << mSelfName << " sending StuckPixels to external CCDB: " << ccdburl << "/browse/" << info_sp.getPath();
+      o2::ccdb::CcdbApi mApi_sp;
+      mApi_sp.init(ccdburl);
+      mApi_sp.storeAsBinaryFile(
+        &image_sp->at(0), image_sp->size(), info_sp.getFileName(), info_sp.getObjectType(),
+        info_sp.getPath(), info_sp.getMetaData(),
+        info_sp.getStartValidityTimestamp(), info_sp.getEndValidityTimestamp());
+      o2::ccdb::adjustOverriddenEOV(mApi_sp, info_sp);
+    }
 
-    LOG(warning) << "PrepareOutputCcdb called with empty arguments. Doing nothing.";
+    delete mErrorTree;
+    mErrorTree = nullptr;
   }
 
   return;
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// O2 functionality allowing to do post-processing when the upstream device
-// tells that there will be no more input data
 void ITSMFTDeadMapBuilder::endOfStream(EndOfStreamContext& ec)
 {
   if (!isEnded) {
     LOG(info) << "endOfStream report: " << mSelfName;
     finalizeOutput();
-    if (mMapObject.getEvolvingMapSize() > 0) {
-      PrepareOutputCcdb(&ec);
-    } else {
-      LOG(warning) << "Time-dependent dead map is empty and will not be forwarded as output";
-    }
+    // 데이터 유무 및 업로드 조건 처리를 내부에서 독립적으로 검증하도록 PrepareOutputCcdb를 무조건 호출구조로 변경
+    PrepareOutputCcdb(&ec); 
     LOG(info) << "Stop process of new data because of endOfStream";
     isEnded = true;
   }
@@ -381,7 +441,6 @@ void ITSMFTDeadMapBuilder::endOfStream(EndOfStreamContext& ec)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// DDS stop method: create local output if endOfStream not processed
 void ITSMFTDeadMapBuilder::stop()
 {
   if (!isEnded) {
@@ -421,12 +480,18 @@ DataProcessorSpec getITSMFTDeadMapBuilderSpec(std::string datasource, bool doMFT
   } else if (datasource == "chipsstatus") {
     inputs.emplace_back("elements", detOrig, "CHIPSSTATUS", 0, Lifetime::Timeframe);
   } else {
-    return DataProcessorSpec{0x0}; // TODO: ADD PROTECTION
+    return DataProcessorSpec{0x0}; 
   }
 
+  inputs.emplace_back("repErr", detOrig, "ErrorInfo", 0, Lifetime::Timeframe);
+
   std::vector<OutputSpec> outputs;
+
   outputs.emplace_back(ConcreteDataTypeMatcher{o2::calibration::Utils::gDataOriginCDBPayload, "TimeDeadMap"}, Lifetime::Sporadic);
   outputs.emplace_back(ConcreteDataTypeMatcher{o2::calibration::Utils::gDataOriginCDBWrapper, "TimeDeadMap"}, Lifetime::Sporadic);
+  // New CCDB for StuckPixels 
+  outputs.emplace_back(ConcreteDataTypeMatcher{o2::calibration::Utils::gDataOriginCDBPayload, "StuckPixels"}, Lifetime::Sporadic);
+  outputs.emplace_back(ConcreteDataTypeMatcher{o2::calibration::Utils::gDataOriginCDBWrapper, "StuckPixels"}, Lifetime::Sporadic);
 
   std::string detector = doMFT ? "mft" : "its";
   std::string objectname_default = detector + "_time_deadmap.root";
@@ -445,7 +510,10 @@ DataProcessorSpec getITSMFTDeadMapBuilderSpec(std::string datasource, bool doMFT
             {"ccdb-url", VariantType::String, "", {"CCDB url. Ignored if endOfStream is processed."}},
             {"outfile", VariantType::String, objectname_default, {"ROOT object file name."}},
             {"local-output", VariantType::Bool, false, {"Save ROOT tree file locally."}},
-            {"output-dir", VariantType::String, "./", {"ROOT tree local output directory."}}}};
+            {"output-dir", VariantType::String, "./", {"ROOT tree local output directory."}},
+
+            {"save-stuck-pixels", VariantType::String, "", {"Save stuck pixels to a separate ROOT file. If empty, stuck pixel computation is disabled."}}
+            }};
 }
 
 } // namespace itsmft
