@@ -132,6 +132,14 @@ class ITSMFTDeadMapBuilder : public Task
 
   // Flag to avoid that endOfStream and stop are both done
   bool isEnded = false;
+
+  std::string mStuckPixelFileName = "";
+  
+  TTree* mErrorTree = nullptr; 
+  short mErrOrbit = 0;  
+  short mErrChipID = 0;        
+  short mErrRow = 0;           
+  short mErrCol = 0;
 };
 
 // Create a processor spec
