@@ -136,12 +136,12 @@ class ITSMFTDeadMapBuilder : public Task
   std::string mStuckPixelFileName = "";
   
   TTree* mErrorTree = nullptr; 
-  short mErrOrbit = 0;  
-  short mErrChipID = 0;        
-  short mErrRow = 0;           
-  short mErrCol = 0;
+  Long64_t mErrOrbit = 0;  
+  UShort_t mErrChipID = 0;        
+  UShort_t mErrRow = 0;           
+  UShort_t mErrCol = 0;
 };
-
+6
 // Create a processor spec
 o2::framework::DataProcessorSpec getITSMFTDeadMapBuilderSpec(std::string datasource, bool doMFT);
 
